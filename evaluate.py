@@ -6,6 +6,8 @@ from argparse import ArgumentParser
 from tqdm import tqdm
 from sklearn.metrics import classification_report
 import random
+import csv
+import json
 
 
 SEED=0
@@ -27,18 +29,13 @@ def to_label(text: str):
     if 'no' in first or '0' in first:
         return 0
     return None  # could not parse
-def sample_fixed(dataset, k, label_col="label"):
-    """
-    Return a balanced dataset with k examples total: k/2 per label.
-    Assumes binary labels
-    """
-    per_label = k // 2
 
+def sample_fixed(dataset, k, label_col="label"):
+    per_label = k // 2
     ds = dataset.shuffle(seed=SEED)
 
     sample = {0: [], 1: []}
     for  item in ds:
-        
         label = int(item[label_col])
         if label in sample and len(sample[label]) < per_label:
             sample[label].append(item["sentence"])
@@ -48,18 +45,36 @@ def sample_fixed(dataset, k, label_col="label"):
     print(sample)
     return sample
 
+def prepare_train_pools(train_ds):
+    """
+    Pre-split training sentences by label for fast random sampling per example.
+    """
+    pools = {0: [], 1: []}
+    for item in train_ds:
+        pools[int(item["label"])].append(item["sentence"])
+    return pools
 
-def build_prompt_fixed(sample):
-    prompt=""
-    #print(sample)
-    for label,sents in sample.items() :
-        if label:
-            label='yes'
-        else:
-            label='no'
+def sample_random_from_pools(pools, k, rng: random.Random):
+    """
+    Balanced random k-shot sample drawn from pools (k/2 per label).
+    """
+    per_label = k // 2
+    return {
+        0: rng.sample(pools[0], per_label),
+        1: rng.sample(pools[1], per_label),
+    }
+
+def build_prompt(sample, sentence: str) -> str:
+    """
+    Build the full prompt (support examples + query) for one sentence.
+    Avoids .format() so braces in text won't break formatting.
+    """
+    prompt = ""
+    for label, sents in sample.items():
+        label_str = "yes" if int(label) == 1 else "no"
         for sent in sents:
-            prompt+=f"Sentence: {sent}\nLinguistically acceptable: {label}\n\n"
-    prompt+="Sentence: {sentence}\nLinguistically acceptable: "
+            prompt += f"Sentence: {sent}\nLinguistically acceptable: {label_str}\n\n"
+    prompt += f"Sentence: {sentence}\nLinguistically acceptable: "
     return prompt
     
 
@@ -71,32 +86,53 @@ val_loader=DataLoader(val,batch_size=16,num_workers=2)
 parser= ArgumentParser()
 parser.add_argument('--k', type=int, help='number of examples in few-shot',default=8)
 parser.add_argument('--example_strat', choices=['random','fixed'],default='fixed')
+
 def main():
-    gt=val["label"]
-    preds=[]
-    args= parser.parse_args()
-    #assert that it is divisible by no of classes (2)
-    assert(args.k%2==0)
-    if args.example_strat=='fixed':
-        sample=sample_fixed(train,args.k)
-        prompt=build_prompt_fixed(sample)
-        print(prompt)
+    args = parser.parse_args()
+    assert args.k % 2 == 0
+
+    base = f"res_k={args.k}_{args.example_strat}"
+    csv_path = base + ".csv"
+    json_path = base + ".json"
+
+    gt = val["label"]
+    preds = []
+    rows = []
+
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model.eval()
-    acc=[]
+
+    # Fixed strategy: choose support once
+    fixed_support = None
+    if args.example_strat == "fixed":
+        fixed_support = sample_fixed(train, args.k)
+
+    # Random strategy: prepare pools once, then sample per validation example
+    rng = random.Random(SEED)
+    pools = None
+    if args.example_strat == "random":
+        pools = prepare_train_pools(train)
+
     with torch.no_grad():
         for batch in tqdm(val_loader):
-            sentences = batch["sentence"]         
-            labels = batch["label"]              
+            sentences = batch["sentence"]
+            labels = batch["label"]  # <-- ADD: grab batch ground truth
 
-            prompts = [prompt.format(sentence=s) for s in sentences]
+            if args.example_strat == "fixed":
+                prompts = [build_prompt(fixed_support, s) for s in sentences]
+            else:
+                prompts = []
+                for s in sentences:
+                    support = sample_random_from_pools(pools, args.k, rng)
+                    prompts.append(build_prompt(support, s))
+
             inputs = tokenizer(
                 prompts,
                 return_tensors="pt",
-                padding=True,          # <-- FIX: pad for batching
+                padding=True,
                 truncation=True,
             ).to("cuda")
 
@@ -106,14 +142,46 @@ def main():
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
+
             gen = outputs[:, inputs["input_ids"].shape[1]:]
             gen_text = tokenizer.batch_decode(gen, skip_special_tokens=True)
 
-            acc+=gen_text
-            preds += [to_label(t) for t in gen_text]
-    for i in range (len(preds)):
-        print(i,acc[i],preds[i])
-    print(classification_report(gt,preds))
+            batch_preds = [to_label(t) for t in gen_text]
+            preds.extend(batch_preds)
 
-        
-main()
+            # <-- EDIT: include gt in each CSV row
+            for p, y, pr, g in zip(prompts, labels, batch_preds, gen_text):
+                rows.append({
+                    "prompt": p,
+                    "gt": int(y),
+                    "pred": pr,
+                    "generated_text": g
+                })
+
+    # JSON classification report
+    report = classification_report(
+        gt,
+        preds,
+        labels=[0, 1],
+        target_names=["no", "yes"],
+        output_dict=True,
+        zero_division=0,
+    )
+
+    # Save CSV (prompt, gt, pred, generated text)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["prompt", "gt", "pred", "generated_text"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Save JSON report
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    # Print paths + pretty report for convenience
+    print(f"Saved CSV:  {csv_path}")
+    print(f"Saved JSON: {json_path}")
+    print(classification_report(gt, preds, labels=[0, 1], target_names=["no", "yes"], zero_division=0))
+
+if __name__ == "__main__":
+    main()
