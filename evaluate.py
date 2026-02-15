@@ -15,9 +15,6 @@ random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 
-#You need to be logged in to your hf account in the env and agree to the terms in the model's page
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b")
-model = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b",device_map="cuda")
 
 
 def to_label(text: str):
@@ -77,18 +74,35 @@ def build_prompt(sample, sentence: str) -> str:
     prompt += f"Sentence: {sentence}\nLinguistically acceptable: "
     return prompt
     
+def save_res_and_report(rows,report,csv_path,json_path):
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["prompt", "gt", "pred", "generated_text"])
+        writer.writeheader()
+        writer.writerows(rows)
 
-train= load_dataset("nyu-mll/glue",'cola',split="train")
-val= load_dataset("nyu-mll/glue",'cola',split="validation")
-val_loader=DataLoader(val,batch_size=16,num_workers=2)
+    # Save JSON report
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
 
 
-parser= ArgumentParser()
-parser.add_argument('--k', type=int, help='number of examples in few-shot',default=8)
-parser.add_argument('--example_strat', choices=['random','fixed'],default='fixed')
+
+
+
 
 def main():
+    #You need to be logged in to your hf account in the env and agree to the terms in the model's page
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b")
+    model = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b",device_map="cuda")
+
+    train= load_dataset("nyu-mll/glue",'cola',split="train")
+    val= load_dataset("nyu-mll/glue",'cola',split="validation")
+    val_loader=DataLoader(val,batch_size=16,num_workers=2)
+
+    parser= ArgumentParser()
+    parser.add_argument('--k', type=int, help='number of examples in few-shot',default=8)
+    parser.add_argument('--example_strat', choices=['random','fixed'],default='fixed')
     args = parser.parse_args()
+
     assert args.k % 2 == 0
 
     base = f"res_k={args.k}_{args.example_strat}"
@@ -149,7 +163,6 @@ def main():
             batch_preds = [to_label(t) for t in gen_text]
             preds.extend(batch_preds)
 
-            # <-- EDIT: include gt in each CSV row
             for p, y, pr, g in zip(prompts, labels, batch_preds, gen_text):
                 rows.append({
                     "prompt": p,
@@ -167,17 +180,8 @@ def main():
         output_dict=True,
         zero_division=0,
     )
-
-    # Save CSV (prompt, gt, pred, generated text)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["prompt", "gt", "pred", "generated_text"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    # Save JSON report
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-
+    save_res_and_report(rows,report,csv_path,json_path)
+    
     # Print paths + pretty report for convenience
     print(f"Saved CSV:  {csv_path}")
     print(f"Saved JSON: {json_path}")
