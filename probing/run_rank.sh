@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python rank_layer_neurons.py --split validation --top_k 1000 --batch_size 64
