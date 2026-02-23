@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -15,10 +15,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ----------------------------
 
 def get_layers(model) -> List[torch.nn.Module]:
-    """
-    Return list of transformer blocks/layers.
-    Works for many HF CausalLMs including Gemma.
-    """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return list(model.model.layers)
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
@@ -29,9 +25,6 @@ def get_layers(model) -> List[torch.nn.Module]:
 
 
 def mlp_modules(layer) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
-    """
-    Return (gate_proj, up_proj, down_proj) modules for a Gemma/LLaMA-style gated MLP.
-    """
     if not hasattr(layer, "mlp"):
         raise RuntimeError("Layer has no .mlp. Inspect the model block and adjust mlp_modules().")
     mlp = layer.mlp
@@ -42,10 +35,6 @@ def mlp_modules(layer) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Modul
 
 
 def mlp_act_fn(layer):
-    """
-    Return the activation function used inside the MLP gate.
-    Usually mlp.act_fn is an nn.Module or callable.
-    """
     mlp = layer.mlp
     if hasattr(mlp, "act_fn"):
         return mlp.act_fn
@@ -53,19 +42,80 @@ def mlp_act_fn(layer):
 
 
 # ----------------------------
-# Prompting for CoLA
+# Few-shot prompt building
 # ----------------------------
 
-def build_prompt(sentence: str) -> str:
-    return f"Sentence: {sentence}\nAcceptability:"
+DEFAULT_FEW_SHOT = [
+    {"sentence": "The dog chased the cat.", "label": 1},
+    {"sentence": "Dog the cat chased.", "label": 0},
+    {"sentence": "She is reading a book.", "label": 1},
+    {"sentence": "Reading she book a is.", "label": 0},
+]
+
+
+def label_to_text(label: int) -> str:
+    # Keep output tokens simple and consistent.
+    return "acceptable" if int(label) == 1 else "unacceptable"
+
+
+def load_few_shot(path: str) -> List[Dict]:
+    """
+    Load few-shot examples from a JSON file.
+
+    Expected formats:
+    1) A list:
+       [{"sentence": "...", "label": 0/1}, ...]
+    2) A dict with "examples":
+       {"examples": [{"sentence": "...", "label": 0/1}, ...]}
+
+    Labels should match CoLA: 1=acceptable, 0=unacceptable.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "examples" in data:
+        data = data["examples"]
+    if not isinstance(data, list):
+        raise ValueError("Few-shot JSON must be a list or a dict with an 'examples' list.")
+    for ex in data:
+        if "sentence" not in ex or "label" not in ex:
+            raise ValueError("Each few-shot example must have 'sentence' and 'label'.")
+        if int(ex["label"]) not in (0, 1):
+            raise ValueError("Few-shot labels must be 0 or 1.")
+    return data
+
+
+def build_few_shot_prefix(
+    few_shot_examples: List[Dict],
+    k: int,
+    template: str = "Sentence: {sentence}\nAcceptability: {answer}\n",
+) -> str:
+    """
+    Build a prefix containing k few-shot examples.
+    """
+    k = min(k, len(few_shot_examples))
+    parts = []
+    for ex in few_shot_examples[:k]:
+        parts.append(
+            template.format(
+                sentence=ex["sentence"],
+                answer=label_to_text(int(ex["label"])),
+            )
+        )
+    return "\n".join(parts).strip() + ("\n\n" if parts else "")
+
+
+def build_prompt(
+    sentence: str,
+    few_shot_prefix: str = "",
+    query_template: str = "Sentence: {sentence}\nAcceptability:",
+) -> str:
+    """
+    Final prompt = [few-shot prefix] + [query]
+    """
+    return few_shot_prefix + query_template.format(sentence=sentence)
 
 
 def pick_position(input_ids: torch.Tensor, attention_mask: torch.Tensor, which: str) -> torch.Tensor:
-    """
-    Return per-example token positions to extract activations from.
-    - "last": last non-pad token index
-    - "cls": first token index (0)
-    """
     if which == "cls":
         return torch.zeros((input_ids.size(0),), dtype=torch.long, device=input_ids.device)
     if which == "last":
@@ -98,12 +148,8 @@ def init_stats(num_layers: int, intermediate_sizes: List[int]) -> RunningStats:
 
 def update_stats(stats: RunningStats, acts_per_layer: List[torch.Tensor], labels: torch.Tensor):
     """
-    acts_per_layer: list of tensors, each shape (B, intermediate_size) at the chosen position.
-    labels: shape (B,), values in {0,1}
-
     IMPORTANT FIX:
-    - If model runs in bfloat16, numpy conversion fails.
-    - Cast to float32 before calling .cpu().numpy().
+    - Cast to float32 before converting to numpy (bfloat16 isn't supported by numpy).
     """
     labels_np = labels.detach().to(torch.long).cpu().numpy()
     pos_idx = np.where(labels_np == 1)[0]
@@ -115,7 +161,6 @@ def update_stats(stats: RunningStats, acts_per_layer: List[torch.Tensor], labels
         stats.n_neg += len(neg_idx)
 
     for l, a in enumerate(acts_per_layer):
-        # bfloat16 -> float32 before numpy
         a_np = a.detach().to(torch.float32).cpu().numpy().astype(np.float64)  # (B, M)
 
         if len(pos_idx) > 0:
@@ -130,10 +175,6 @@ def update_stats(stats: RunningStats, acts_per_layer: List[torch.Tensor], labels
 
 
 def compute_scores(stats: RunningStats, eps: float = 1e-12) -> List[np.ndarray]:
-    """
-    Returns: list per layer, score array shape (intermediate_size,)
-    score = |mean_pos - mean_neg| / sqrt(0.5*(var_pos + var_neg) + eps)
-    """
     if stats.n_pos == 0 or stats.n_neg == 0:
         raise RuntimeError("Need both positive and negative samples to compute predictivity scores.")
 
@@ -161,20 +202,15 @@ def extract_mlp_act_outputs(
     tokenizer,
     sentences: List[str],
     device: str,
+    few_shot_prefix: str,
+    query_template: str,
     position_mode: str = "last",
     max_length: int = 256,
 ) -> List[torch.Tensor]:
-    """
-    Return list per layer:
-      acts[layer] is tensor shape (B, intermediate_size) = act_fn(gate_proj(x)) at chosen token position.
-
-    Implementation detail:
-    - Hook gate_proj output and capture it per layer, then apply act_fn ourselves.
-    """
     model.eval()
 
     enc = tokenizer(
-        [build_prompt(s) for s in sentences],
+        [build_prompt(s, few_shot_prefix=few_shot_prefix, query_template=query_template) for s in sentences],
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -194,7 +230,6 @@ def extract_mlp_act_outputs(
 
         def make_hook(layer_index: int):
             def hook(module, inp, out):
-                # out shape: (B, T, intermediate_size)
                 gate_outputs[layer_index] = out
             return hook
 
@@ -211,7 +246,6 @@ def extract_mlp_act_outputs(
             raise RuntimeError(f"Missing gate_proj hook output for layer {li}.")
         gate = gate_outputs[li]  # (B, T, M)
         act_fn = mlp_act_fn(layer)
-
         act = act_fn(gate) if callable(act_fn) else act_fn(gate)
 
         b_idx = torch.arange(act.size(0), device=act.device)
@@ -247,6 +281,21 @@ def main():
     ap.add_argument("--top_k", type=int, default=1000)
     ap.add_argument("--out_dir", type=str, default=".")
     ap.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "float32"], default="bfloat16")
+
+    # Few-shot options
+    ap.add_argument("--few_shot_k", type=int, default=0,
+                    help="Number of few-shot examples to prepend (0 disables few-shot).")
+    ap.add_argument("--few_shot_path", type=str, default="",
+                    help="Path to JSON file with few-shot examples. If empty and --few_shot_default is set, uses built-in examples.")
+    ap.add_argument("--few_shot_default", action="store_true",
+                    help="Use built-in tiny few-shot examples (only if --few_shot_k > 0 and --few_shot_path is empty).")
+    ap.add_argument("--few_shot_template", type=str,
+                    default="Sentence: {sentence}\nAcceptability: {answer}\n",
+                    help="Template for each few-shot example. Fields: {sentence}, {answer}.")
+    ap.add_argument("--query_template", type=str,
+                    default="Sentence: {sentence}\nAcceptability:",
+                    help="Template for the query example. Field: {sentence}.")
+
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -257,12 +306,29 @@ def main():
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
 
+    # Build few-shot prefix once (reused for all examples)
+    few_shot_prefix = ""
+    if args.few_shot_k > 0:
+        if args.few_shot_path:
+            few_shot_examples = load_few_shot(args.few_shot_path)
+        elif args.few_shot_default:
+            few_shot_examples = DEFAULT_FEW_SHOT
+        else:
+            raise ValueError(
+                "Few-shot enabled (--few_shot_k > 0) but no examples provided. "
+                "Use --few_shot_path or --few_shot_default."
+            )
+        few_shot_prefix = build_few_shot_prefix(
+            few_shot_examples=few_shot_examples,
+            k=args.few_shot_k,
+            template=args.few_shot_template,
+        )
+
     print(f"[info] loading model={args.model} dtype={args.dtype}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # NOTE: newer transformers prefers `dtype=` over `torch_dtype=`, but torch_dtype still works.
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch_dtype,
@@ -285,6 +351,10 @@ def main():
     num_layers = len(intermediate_sizes)
     print(f"[info] num_layers={num_layers}, intermediate_size[0]={intermediate_sizes[0]}")
 
+    if few_shot_prefix:
+        # Useful to confirm prompt size behavior
+        print(f"[info] few-shot enabled: k={args.few_shot_k}, prefix_chars={len(few_shot_prefix)}")
+
     stats = init_stats(num_layers, intermediate_sizes)
 
     for start in range(0, len(ds), args.batch_size):
@@ -298,6 +368,8 @@ def main():
             tokenizer=tokenizer,
             sentences=sentences,
             device=device,
+            few_shot_prefix=few_shot_prefix,
+            query_template=args.query_template,
             position_mode=args.position,
             max_length=args.max_length,
         )
@@ -319,7 +391,7 @@ def main():
     top_items = all_items[: args.top_k]
 
     layer_counts = [0] * num_layers
-    for l, i, sc in top_items:
+    for l, i, _ in top_items:
         layer_counts[l] += 1
 
     csv_path = os.path.join(args.out_dir, "top_neurons.csv")
@@ -340,6 +412,9 @@ def main():
                 "n_examples": len(ds),
                 "n_pos": stats.n_pos,
                 "n_neg": stats.n_neg,
+                "few_shot_k": args.few_shot_k,
+                "few_shot_path": args.few_shot_path,
+                "few_shot_default": bool(args.few_shot_default),
                 "layer_counts": layer_counts,
             },
             f,

@@ -1,6 +1,4 @@
-
 import argparse
-import os
 import random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -35,26 +33,17 @@ def pick_device() -> torch.device:
 # -----------------------------
 # 1) Data: CoLA + balanced sampling
 # -----------------------------
-def load_cola() -> Tuple[dict, dict]:
-    """
-    Loads GLUE CoLA.
-    Returns:
-      train_ds, valid_ds
-    """
+def load_cola():
     ds = load_dataset("glue", "cola")
     return ds["train"], ds["validation"]
 
 
 def balanced_sample_train(train_ds, per_label: int, seed: int) -> List[dict]:
-    """
-    Sample `per_label` examples from each label (0/1) from the training split.
-    """
     rng = random.Random(seed)
     by_label = {0: [], 1: []}
     for ex in train_ds:
         by_label[int(ex["label"])].append(ex)
 
-    # shuffle then slice
     for y in [0, 1]:
         rng.shuffle(by_label[y])
         if len(by_label[y]) < per_label:
@@ -69,6 +58,43 @@ def balanced_sample_train(train_ds, per_label: int, seed: int) -> List[dict]:
     return sampled
 
 
+# -----------------------------
+# 1b) Few-shot: balanced demonstrations
+# -----------------------------
+def build_few_shot_prefix(train_ds, k_per_label: int, seed: int, demo_template: str) -> str:
+    """
+    Build a single string containing balanced demonstrations: k_per_label from each class.
+    Interleaves labels: 0,1,0,1,...
+    """
+    rng = random.Random(seed)
+    by_label = {0: [], 1: []}
+    for ex in train_ds:
+        by_label[int(ex["label"])].append(ex)
+
+    for y in [0, 1]:
+        rng.shuffle(by_label[y])
+        if len(by_label[y]) < k_per_label:
+            raise ValueError(f"Not enough examples for label={y} to build few-shot prefix.")
+        by_label[y] = by_label[y][:k_per_label]
+
+    demos = []
+    for i in range(k_per_label):
+        for y in [0, 1]:
+            demos.append(demo_template.format(label=y, sentence=by_label[y][i]["sentence"]))
+
+    return "".join(demos)
+
+
+def apply_few_shot(text: str, prefix: str, target_template: str) -> str:
+    """
+    Final prompt = demonstrations + target query.
+    """
+    return prefix + target_template.format(sentence=text)
+
+
+# -----------------------------
+# 1c) Tokenization / batching
+# -----------------------------
 @dataclass
 class Batch:
     input_ids: torch.Tensor
@@ -82,14 +108,26 @@ def make_dataloader(
     batch_size: int,
     max_length: int,
     shuffle: bool,
+    few_shot_prefix: str = "",
+    few_shot_target_template: str = "Sentence: {sentence}\nLabel:",
 ) -> DataLoader:
     """
     Tokenize and batch examples for a causal LM input.
     CoLA input text lives in the 'sentence' field.
+
+    If few_shot_prefix != "":
+      prompt = prefix + target_template(sentence=...)
+    else:
+      prompt = raw sentence
     """
 
     def collate(batch_ex: List[dict]) -> Batch:
-        texts = [ex["sentence"] for ex in batch_ex]
+        texts_raw = [ex["sentence"] for ex in batch_ex]
+        if few_shot_prefix:
+            texts = [apply_few_shot(t, few_shot_prefix, few_shot_target_template) for t in texts_raw]
+        else:
+            texts = texts_raw
+
         ys = torch.tensor([int(ex["label"]) for ex in batch_ex], dtype=torch.long)
 
         tok = tokenizer(
@@ -122,7 +160,6 @@ class LayerActivationCatcher:
         self.last: Optional[torch.Tensor] = None
 
     def hook_fn(self, module, inp, out):
-        # out may be tuple in some cases; we normalize to a tensor
         if isinstance(out, (tuple, list)):
             out = out[0]
         self.last = out
@@ -143,9 +180,9 @@ def find_transformer_layers(model) -> List[torch.nn.Module]:
 def find_mlp_activation_module(layer: torch.nn.Module) -> torch.nn.Module:
     """
     Find the activation module inside a layer's MLP.
-    This is heuristic but works for many HF decoder-only architectures:
-    - look for submodule names that suggest activation: 'act', 'activation'
-    - or module types: GELU / SiLU / ReLU variants
+    Heuristic:
+      - submodule name contains 'act' or 'activation'
+      - or module class looks like gelu/silu/relu/swish
     """
     candidates = []
     for name, mod in layer.named_modules():
@@ -157,13 +194,11 @@ def find_mlp_activation_module(layer: torch.nn.Module) -> torch.nn.Module:
         if looks_like_act_name or looks_like_act_type:
             candidates.append((name, mod))
 
-    # Prefer *direct* activation modules rather than whole MLP blocks.
-    # If multiple, pick the shallowest (fewest dots) and most "act"-like.
     if not candidates:
         raise ValueError("Could not find an activation module in this layer's MLP.")
 
     def score(item):
-        name, mod = item
+        name, _ = item
         lname = name.lower()
         depth = lname.count(".")
         bonus = 0
@@ -178,7 +213,6 @@ def find_mlp_activation_module(layer: torch.nn.Module) -> torch.nn.Module:
 @torch.no_grad()
 def extract_features_for_layer(
     model,
-    tokenizer,
     dataloader: DataLoader,
     layer_idx: int,
     positions: List[str],
@@ -190,10 +224,11 @@ def extract_features_for_layer(
       - run the dataloader
       - collect features at requested positions
 
-    positions options:
+    positions:
       - "first": token position 0
-      - "last": last non-pad token (based on attention_mask)
+      - "last": last non-pad token (attention_mask-based)
       - "mean": mean over non-pad tokens
+
     Returns:
       feats_by_pos: dict pos -> [N, hidden]
       labels: [N]
@@ -213,7 +248,6 @@ def extract_features_for_layer(
         attention_mask = batch.attention_mask.to(device)
         ys = batch.labels.cpu().numpy()
 
-        # Forward pass (we just need hooks to fire)
         _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
         if catcher.last is None:
@@ -222,29 +256,25 @@ def extract_features_for_layer(
         A = catcher.last  # [B, T, H]
         B, T, H = A.shape
 
-        # compute indices / masks
-        # last non-pad index: (sum(mask)-1)
         lengths = attention_mask.sum(dim=1)  # [B]
         last_idx = torch.clamp(lengths - 1, min=0)  # [B]
 
         for p in positions:
             if p == "first":
-                f = A[:, 0, :]  # [B, H]
+                f = A[:, 0, :]
             elif p == "last":
-                f = A[torch.arange(B, device=device), last_idx, :]  # [B, H]
+                f = A[torch.arange(B, device=device), last_idx, :]
             elif p == "mean":
-                # mean over valid tokens
                 mask = attention_mask.unsqueeze(-1)  # [B, T, 1]
-                denom = mask.sum(dim=1).clamp(min=1)  # [B, 1]
-                f = (A * mask).sum(dim=1) / denom  # [B, H]
+                denom = mask.sum(dim=1).clamp(min=1)
+                f = (A * mask).sum(dim=1) / denom
             else:
                 raise ValueError(f"Unknown position spec: {p}")
 
             feats[p].append(f.detach().float().cpu().numpy())
 
         ys_all.append(ys)
-
-        catcher.last = None  # clear for safety
+        catcher.last = None
 
     handle.remove()
 
@@ -264,11 +294,6 @@ def train_and_eval_probe(
     C: float = 1.0,
     max_iter: int = 2000,
 ) -> Dict[str, float]:
-    """
-    Trains a simple linear probe:
-      StandardScaler -> LogisticRegression
-    Returns accuracy and F1.
-    """
     clf = Pipeline(
         steps=[
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
@@ -295,20 +320,27 @@ def main():
     ap.add_argument("--max_length", type=int, default=128)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--positions", nargs="+", default=["first", "last"],
-                    help='Positions to probe: first last mean (space-separated)')
+                    help="Positions to probe: first last mean (space-separated)")
     ap.add_argument("--save_csv", default="probe_results.csv")
+
+    # Few-shot options
+    ap.add_argument("--few_shot_k", type=int, default=0,
+                    help="If >0, prepend K examples per label (balanced) as in-context demonstrations.")
+    ap.add_argument("--few_shot_seed", type=int, default=123,
+                    help="Seed for selecting few-shot demonstration examples.")
+    ap.add_argument("--few_shot_template", type=str, default="Label: {label}\nSentence: {sentence}\n\n",
+                    help="Format for each demonstration. Must contain {label} and {sentence}.")
+    ap.add_argument("--few_shot_target_template", type=str, default="Sentence: {sentence}\nLabel:",
+                    help="Format for the target query sentence appended after demonstrations.")
     args = ap.parse_args()
 
     set_seed(args.seed)
     device = pick_device()
 
-    # Tokenizer / Model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tokenizer.pad_token is None:
-        # decoder-only models often need pad_token defined for batching
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Use float16 on GPU if available to reduce memory
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -317,35 +349,49 @@ def main():
     )
     model.eval()
 
-    # Data
     train_ds, valid_ds = load_cola()
+
+    # Build few-shot prefix (optional)
+    few_shot_prefix = ""
+    if args.few_shot_k > 0:
+        few_shot_prefix = build_few_shot_prefix(
+            train_ds=train_ds,
+            k_per_label=args.few_shot_k,
+            seed=args.few_shot_seed,
+            demo_template=args.few_shot_template,
+        )
+        print(f"Few-shot enabled: {args.few_shot_k} per label ({2*args.few_shot_k} demos total)")
+        print("Tip: for few-shot runs, --positions last is usually the most meaningful.\n")
+
     train_examples = balanced_sample_train(train_ds, per_label=args.per_label, seed=args.seed)
     valid_examples = list(valid_ds)
 
     train_loader = make_dataloader(
-        train_examples, tokenizer, args.batch_size, args.max_length, shuffle=False
+        train_examples, tokenizer, args.batch_size, args.max_length, shuffle=False,
+        few_shot_prefix=few_shot_prefix,
+        few_shot_target_template=args.few_shot_target_template,
     )
     valid_loader = make_dataloader(
-        valid_examples, tokenizer, args.batch_size, args.max_length, shuffle=False
+        valid_examples, tokenizer, args.batch_size, args.max_length, shuffle=False,
+        few_shot_prefix=few_shot_prefix,
+        few_shot_target_template=args.few_shot_target_template,
     )
 
-    # Layers
     layers = find_transformer_layers(model)
     n_layers = len(layers)
     print(f"Model has {n_layers} transformer layers")
     print(f"Probing positions: {args.positions}")
 
-    results = []  # list of dict rows
+    results = []
 
-    # Loop over layers; for each layer, extract activations -> train probes -> eval
     for layer_idx in range(n_layers):
         print(f"\n[Layer {layer_idx}] extracting features...")
         Xtr_by_pos, ytr = extract_features_for_layer(
-            model=model, tokenizer=tokenizer, dataloader=train_loader,
+            model=model, dataloader=train_loader,
             layer_idx=layer_idx, positions=args.positions, device=device
         )
         Xva_by_pos, yva = extract_features_for_layer(
-            model=model, tokenizer=tokenizer, dataloader=valid_loader,
+            model=model, dataloader=valid_loader,
             layer_idx=layer_idx, positions=args.positions, device=device
         )
 
@@ -363,14 +409,12 @@ def main():
             results.append(row)
             print(f"  pos={pos:>5s}  acc={metrics['acc']:.4f}  f1={metrics['f1']:.4f}")
 
-    # Identify best layer per position (by F1)
     print("\n=== Best layer per position (by F1) ===")
     for pos in args.positions:
         pos_rows = [r for r in results if r["position"] == pos]
         best = max(pos_rows, key=lambda r: r["f1"])
         print(f"pos={pos:>5s} -> best_layer={best['layer']}  f1={best['f1']:.4f}  acc={best['acc']:.4f}")
 
-    # Save CSV
     import csv
     with open(args.save_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["layer", "position", "acc", "f1"])

@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=1 python rank_layer_neurons.py --split validation --top_k 1000 --batch_size 64
+CUDA_VISIBLE_DEVICES=1 python rank_layer_neurons.py --split validation --top_k 1000 --batch_size 64 --few_shot_k 16 --few_shot_default --max_length 1024 --out_dir fewshots_rank
